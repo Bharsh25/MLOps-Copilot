@@ -74,5 +74,55 @@ def compare_runs(
     ]
 
 
+@mcp.tool()
+def list_registered_models() -> list[dict]:
+    """List all registered models with their latest version and aliases.
+    Use this to discover which models are available before asking for details."""
+    log.info("tool called: list_registered_models")
+    return [
+        {
+            "name": m.name,
+            "aliases": dict(m.aliases or {}),
+            "latest_versions": [v.version for v in (m.latest_versions or [])],
+        }
+        for m in client.search_registered_models()
+    ]
+
+@mcp.tool()
+def get_model_info(model_name: str) -> dict:
+    """Get all versions of one registered model, including the source run's
+    metrics and which version has the 'champion' alias (the one to deploy).
+
+    Args:
+        model_name: Exact registered model name, e.g. 'breast-cancer-model'.
+    """
+    log.info("tool called: get_model_info(%s)", model_name)
+    versions = client.search_model_versions(f"name='{model_name}'")
+    if not versions:
+        raise ValueError(
+            f"Model '{model_name}' not found. Call list_registered_models first."
+        )
+
+    # Aliases live on the registered model: {alias: version}. Invert to {version: [aliases]}.
+    registered = client.get_registered_model(model_name)
+    aliases_by_version = {}
+    for alias, ver in (registered.aliases or {}).items():
+        aliases_by_version.setdefault(str(ver), []).append(alias)
+
+    result = []
+    for v in versions:
+        run = client.get_run(v.run_id)
+        result.append(
+            {
+                "version": v.version,
+                "aliases": aliases_by_version.get(str(v.version), []),
+                "run_id": v.run_id,
+                "metrics": run.data.metrics,
+                "params": run.data.params,
+            }
+        )
+    return {"model_name": model_name, "versions": result}
+
+
 if __name__ == "__main__":
     mcp.run()  # stdio transport
