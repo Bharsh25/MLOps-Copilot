@@ -1,0 +1,4 @@
+.venv/
+.env
+mlruns/
+__pycache__/mlflow.db
