@@ -3,6 +3,13 @@ import sys
 from pathlib import Path
 import os
 import httpx
+import json
+import secrets
+import subprocess
+import time
+from datetime import datetime, timezone
+
+from dotenv import load_dotenv
 
 from mlflow.tracking import MlflowClient
 from mcp.server.fastmcp import FastMCP
@@ -15,6 +22,22 @@ API_URL = os.getenv("MODEL_API_URL", "http://localhost:8000")
 
 DB_PATH = Path(__file__).resolve().parent.parent / "mlflow.db"
 client = MlflowClient(tracking_uri=f"sqlite:///{DB_PATH.as_posix()}")
+ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(ROOT / ".env")
+
+# Safe default: write actions are BLOCKED unless .env sets MLOPS_READ_ONLY=false
+READ_ONLY = os.getenv("MLOPS_READ_ONLY", "true").lower() != "false"
+AUDIT_LOG = ROOT / "logs" / "audit.jsonl"
+TOKEN_TTL = 300  # seconds a confirmation token stays valid
+PENDING: dict[str, dict] = {}
+
+
+def audit(event: str, **details) -> None:
+    """Append one JSON line to the audit log."""
+    AUDIT_LOG.parent.mkdir(exist_ok=True)
+    entry = {"time": datetime.now(timezone.utc).isoformat(), "event": event, **details}
+    with open(AUDIT_LOG, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
 
 mcp = FastMCP("mlops-copilot")
 
@@ -158,6 +181,113 @@ def check_deployment_status(model_name: str = "breast-cancer-model") -> dict:
         "deployed_version": deployed,
         "champion_version": champion_version,
         "up_to_date": deployed == champion_version,
+    }
+
+@mcp.tool()
+def trigger_retrain(
+    n_estimators: int = 100,
+    max_depth: int | None = None,
+    confirm_token: str | None = None,
+) -> dict:
+    """WRITE ACTION: retrain the breast-cancer Random Forest, log a new MLflow
+    run, and register it as a NEW model version. This does NOT change the
+    'champion' alias or the deployed model.
+
+    Two-step flow: call FIRST without confirm_token to get a preview and a
+    token. Show the preview to the user and ask for approval. Only after the
+    user says yes, call again with the SAME parameters and the token.
+    Never confirm on the user's behalf.
+
+    Args:
+        n_estimators: Number of trees, 10 to 500 (default 100).
+        max_depth: Max tree depth, 1 to 30, or omit for unlimited.
+        confirm_token: Token from the preview step; omit on the first call.
+    """
+    params = {"n_estimators": n_estimators, "max_depth": max_depth}
+    log.info("tool called: trigger_retrain(%s)", params)
+
+    # 1. Validate inputs
+    if not 10 <= n_estimators <= 500:
+        audit("rejected", params=params, reason="n_estimators out of range")
+        raise ValueError("n_estimators must be between 10 and 500.")
+    if max_depth is not None and not 1 <= max_depth <= 30:
+        audit("rejected", params=params, reason="max_depth out of range")
+        raise ValueError("max_depth must be between 1 and 30, or omitted.")
+
+    # 2. Read-only mode blocks everything
+    if READ_ONLY:
+        audit("blocked_read_only", params=params)
+        return {
+            "status": "BLOCKED",
+            "reason": "Server is in read-only mode. Write actions are disabled.",
+        }
+
+    # 3. Step one: issue a preview and a token
+    if not confirm_token:
+        now = time.time()
+        for t in [t for t, p in PENDING.items() if p["expires"] < now]:
+            PENDING.pop(t)
+        token = secrets.token_hex(4)
+        PENDING[token] = {"params": params, "expires": now + TOKEN_TTL}
+        audit("preview_issued", params=params, token=token)
+        return {
+            "status": "CONFIRMATION_REQUIRED",
+            "preview": (
+                f"Retrain Random Forest (n_estimators={n_estimators}, "
+                f"max_depth={max_depth}) on the breast cancer data, log a new "
+                "MLflow run, and register a new model version. The champion "
+                "and the deployed model stay unchanged."
+            ),
+            "confirm_token": token,
+            "expires_in_seconds": TOKEN_TTL,
+            "next_step": "Ask the user to approve, then call again with the same parameters and this token.",
+        }
+
+    # 4. Step two: check the token (single use, must match the parameters)
+    pending = PENDING.pop(confirm_token, None)
+    if pending is None or pending["expires"] < time.time() or pending["params"] != params:
+        audit("confirmation_rejected", params=params, token=confirm_token)
+        return {
+            "status": "REJECTED",
+            "reason": "Token is invalid, expired, already used, or the parameters changed. Start again without a token.",
+        }
+
+    # 5. Execute
+    audit("started", params=params, token=confirm_token)
+    cmd = [
+        sys.executable,
+        str(ROOT / "training" / "retrain.py"),
+        "--n-estimators", str(n_estimators),
+        "--register",
+    ]
+    if max_depth is not None:
+        cmd += ["--max-depth", str(max_depth)]
+
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=300, cwd=str(ROOT)
+        )
+    except subprocess.TimeoutExpired:
+        audit("failed", params=params, error="timeout")
+        return {"status": "FAILED", "error": "Retraining timed out after 300 seconds."}
+
+    if proc.returncode != 0:
+        audit("failed", params=params, error=proc.stderr[-500:])
+        return {"status": "FAILED", "error": proc.stderr[-500:]}
+
+    line = next(
+        (l for l in proc.stdout.splitlines() if l.startswith("RESULT_JSON:")), None
+    )
+    if line is None:
+        audit("failed", params=params, error="no result line")
+        return {"status": "FAILED", "error": "Training finished but returned no result."}
+
+    result = json.loads(line[len("RESULT_JSON:"):])
+    audit("completed", params=params, result=result)
+    return {
+        "status": "COMPLETED",
+        **result,
+        "note": "New version registered. Champion and the deployed model are unchanged.",
     }
 
 
