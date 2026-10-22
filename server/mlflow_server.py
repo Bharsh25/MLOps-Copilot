@@ -290,6 +290,47 @@ def trigger_retrain(
         "note": "New version registered. Champion and the deployed model are unchanged.",
     }
 
+@mcp.tool()
+def get_logs(source: str = "audit", lines: int = 20) -> dict:
+    """Read recent logs to see what happened and why something failed.
+
+    Args:
+        source: 'audit' for the record of write actions (retrain attempts),
+                or 'api' for the deployed model API container's logs.
+        lines: How many recent lines to return, 1 to 200 (default 20).
+    """
+    log.info("tool called: get_logs(%s, %s)", source, lines)
+    if not 1 <= lines <= 200:
+        raise ValueError("lines must be between 1 and 200.")
+
+    if source == "audit":
+        if not AUDIT_LOG.exists():
+            return {"source": "audit", "entries": []}
+        entries = []
+        for line in AUDIT_LOG.read_text(encoding="utf-8").splitlines()[-lines:]:
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                entry = {"raw": line}
+            if "token" in entry:
+                entry["token"] = "[redacted]"  # never expose confirmation tokens
+            entries.append(entry)
+        return {"source": "audit", "entries": entries}
+
+    if source == "api":
+        try:
+            proc = subprocess.run(
+                ["docker", "logs", "--tail", str(lines), "mlops-api"],
+                capture_output=True, text=True, timeout=15,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            return {"source": "api", "error": f"Could not read container logs: {e}"}
+        if proc.returncode != 0:
+            return {"source": "api", "error": proc.stderr[-500:]}
+        return {"source": "api", "logs": (proc.stdout + proc.stderr)[-4000:]}
+
+    raise ValueError("source must be 'audit' or 'api'.")
+
 
 if __name__ == "__main__":
     mcp.run()  # stdio transport
