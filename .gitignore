@@ -3,3 +3,5 @@
 mlruns/
 __pycache__/
 mlflow.db
+api/model.joblib
+api/model_meta.json

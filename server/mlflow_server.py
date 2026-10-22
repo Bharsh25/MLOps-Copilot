@@ -1,6 +1,8 @@
 import logging
 import sys
 from pathlib import Path
+import os
+import httpx
 
 from mlflow.tracking import MlflowClient
 from mcp.server.fastmcp import FastMCP
@@ -9,6 +11,7 @@ from mcp.server.fastmcp import FastMCP
 # stdout is reserved for the MCP protocol, so log to stderr.
 logging.basicConfig(stream=sys.stderr, level=logging.INFO)
 log = logging.getLogger("mlops-copilot")
+API_URL = os.getenv("MODEL_API_URL", "http://localhost:8000")
 
 DB_PATH = Path(__file__).resolve().parent.parent / "mlflow.db"
 client = MlflowClient(tracking_uri=f"sqlite:///{DB_PATH.as_posix()}")
@@ -24,6 +27,7 @@ def list_experiments() -> list[dict]:
     results = []
     for exp in client.search_experiments():
         runs = client.search_runs([exp.experiment_id], max_results=1000)
+
         results.append(
             {
                 "name": exp.name,
@@ -122,6 +126,39 @@ def get_model_info(model_name: str) -> dict:
             }
         )
     return {"model_name": model_name, "versions": result}
+
+@mcp.tool()
+def check_deployment_status(model_name: str = "breast-cancer-model") -> dict:
+    """Check whether the deployed model API is running and whether it serves
+    the current 'champion' version from the registry.
+
+    Args:
+        model_name: Registered model name (default 'breast-cancer-model').
+    """
+    log.info("tool called: check_deployment_status(%s)", model_name)
+    registered = client.get_registered_model(model_name)
+    champion = (registered.aliases or {}).get("champion")
+    champion_version = str(champion) if champion is not None else None
+
+    try:
+        resp = httpx.get(f"{API_URL}/health", timeout=5)
+        resp.raise_for_status()
+        health = resp.json()
+    except Exception as e:
+        return {
+            "status": "DOWN",
+            "error": str(e),
+            "champion_version": champion_version,
+        }
+
+    deployed = str(health.get("model_version"))
+    return {
+        "status": "UP",
+        "serving_model": health.get("model_name"),
+        "deployed_version": deployed,
+        "champion_version": champion_version,
+        "up_to_date": deployed == champion_version,
+    }
 
 
 if __name__ == "__main__":
