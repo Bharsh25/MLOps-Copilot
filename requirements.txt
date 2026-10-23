@@ -2,6 +2,7 @@ aiohappyeyeballs==2.7.1
 aiohttp==3.14.5
 aiosignal==1.4.0
 alembic==1.20.0
+altair==6.3.0
 annotated-doc==0.0.5
 annotated-types==0.8.0
 anyio==4.15.1
@@ -79,6 +80,7 @@ pycparser==3.11
 pydantic==2.14.1
 pydantic-settings==2.16.1
 pydantic_core==2.50.1
+pydeck==0.9.3
 Pygments==2.21.0
 PyJWT==2.15.1
 pyparsing==3.3.3
@@ -103,6 +105,7 @@ SQLAlchemy==2.1.6
 sqlparse==0.6.0
 sse-starlette==3.5.0
 starlette==1.9.0
+streamlit==1.66.1
 threadpoolctl==3.7.0
 truststore==0.10.5
 typer==0.27.3
@@ -112,7 +115,9 @@ tzdata==2026.5
 urllib3==2.8.0
 uvicorn==0.54.0
 waitress==3.0.2
+watchdog==6.0.0
 wcwidth==0.9.3
+websockets==17.3
 Werkzeug==3.1.9
 xgboost==3.4.1
 yarl==1.25.1
