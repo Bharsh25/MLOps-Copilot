@@ -21,7 +21,7 @@ log = logging.getLogger("mlops-copilot")
 API_URL = os.getenv("MODEL_API_URL", "http://localhost:8000")
 
 DB_PATH = Path(__file__).resolve().parent.parent / "mlflow.db"
-client = MlflowClient(tracking_uri=f"sqlite:///{DB_PATH.as_posix()}")
+client = MlflowClient(tracking_uri=f"sqlite:///{DB_PATH.as_posix()}?timeout=30")
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
 
@@ -253,6 +253,7 @@ def trigger_retrain(
         }
 
     # 5. Execute
+        # 5. Execute
     audit("started", params=params, token=confirm_token)
     cmd = [
         sys.executable,
@@ -263,20 +264,48 @@ def trigger_retrain(
     if max_depth is not None:
         cmd += ["--max-depth", str(max_depth)]
 
+    logs_dir = ROOT / "logs"
+    logs_dir.mkdir(exist_ok=True)
+    out_path = logs_dir / "retrain_stdout.log"
+    err_path = logs_dir / "retrain_stderr.log"
+    env = {
+        **os.environ,
+        "PYTHONUNBUFFERED": "1",
+        "MLFLOW_DISABLE_TELEMETRY": "true",
+        "DO_NOT_TRACK": "true",
+    }
+
     try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=300, cwd=str(ROOT)
-        )
+        with open(out_path, "w", encoding="utf-8") as out, open(
+            err_path, "w", encoding="utf-8"
+        ) as err:
+            proc = subprocess.run(
+                cmd,
+                stdin=subprocess.DEVNULL,  # do not share the MCP stdin pipe
+                stdout=out,                # files instead of pipes
+                stderr=err,
+                timeout=120,
+                cwd=str(ROOT),
+                env=env,
+            )
     except subprocess.TimeoutExpired:
-        audit("failed", params=params, error="timeout")
-        return {"status": "FAILED", "error": "Retraining timed out after 300 seconds."}
+        tail = err_path.read_text(encoding="utf-8", errors="replace")[-500:]
+        audit("failed", params=params, error="timeout", stderr_tail=tail)
+        return {
+            "status": "FAILED",
+            "error": "Retraining timed out after 120 seconds.",
+            "stderr_tail": tail,
+        }
+
+    stdout = out_path.read_text(encoding="utf-8", errors="replace")
+    stderr = err_path.read_text(encoding="utf-8", errors="replace")
 
     if proc.returncode != 0:
-        audit("failed", params=params, error=proc.stderr[-500:])
-        return {"status": "FAILED", "error": proc.stderr[-500:]}
+        audit("failed", params=params, error=stderr[-500:])
+        return {"status": "FAILED", "error": stderr[-500:]}
 
     line = next(
-        (l for l in proc.stdout.splitlines() if l.startswith("RESULT_JSON:")), None
+        (l for l in stdout.splitlines() if l.startswith("RESULT_JSON:")), None
     )
     if line is None:
         audit("failed", params=params, error="no result line")

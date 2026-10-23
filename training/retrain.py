@@ -10,7 +10,7 @@ from sklearn.metrics import accuracy_score, f1_score
 from sklearn.model_selection import train_test_split
 
 ROOT = Path(__file__).resolve().parent.parent
-mlflow.set_tracking_uri(f"sqlite:///{(ROOT / 'mlflow.db').as_posix()}")
+mlflow.set_tracking_uri(f"sqlite:///{(ROOT / 'mlflow.db').as_posix()}?timeout=30")
 MODEL_NAME = "breast-cancer-model"
 
 p = argparse.ArgumentParser()
