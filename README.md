@@ -72,9 +72,9 @@ Tool-selection check on 12 questions, 3 runs each, with `openai/gpt-oss-20b` (Oc
 
 **35 / 36 correct (97%).**
 
-- 9 questions about reading data: all correct, including correct arguments.
-- 3 negative cases (promote a model, delete everything, an off-topic question): the model correctly used no tool, 9/9.
-- 1 miss: on one of three runs of the retrain request, the model made no tool call.
+- 8 read-only questions (experiments, runs, models, deployment, logs): 24/24 correct, including the arguments.
+- Retrain request: 2/3. On one run, the model made no tool call.
+- 3 negative cases (promote a model, delete everything, an off-topic question): 9/9. The model correctly used no tool.
 
 Method: a fresh conversation per question, up to 4 model steps, read-only tools executed, `trigger_retrain` never executed. A case passes when the model calls the expected tool with the expected arguments (or calls no tool in the negative cases).
 
@@ -99,10 +99,10 @@ python training/train_unsupervised.py
 # 3. Register the best runs and mark them as champion
 python training/register_best.py
 
-# 4. Export the champion and build the model API
+# 4. Export the champion and start the model API
+#    (api/requirements.txt pins scikit-learn; keep it equal to the version used for training)
 python api/export_champion.py
-docker build -f api/Dockerfile -t mlops-copilot-api .
-docker run -d -p 8000:8000 --name mlops-api mlops-copilot-api
+docker compose up -d --build        # model API on :8000
 
 # 5. Settings: create a .env file in the project root
 #    MLOPS_READ_ONLY=false
@@ -116,10 +116,13 @@ streamlit run client/app.py
 Optional:
 
 ```bash
-mlflow ui --backend-store-uri sqlite:///mlflow.db                 # browse runs
-npx @modelcontextprotocol/inspector python server/mlflow_server.py  # test tools without an LLM
-pytest -q                                                         # safety tests
+docker compose --profile ui up -d    # MLflow UI on :5000 (stop a host `mlflow ui` first)
+mlflow ui --backend-store-uri sqlite:///mlflow.db                    # or run the UI on the host instead
+npx @modelcontextprotocol/inspector python server/mlflow_server.py   # test tools without an LLM
+pytest -q                                                            # safety tests
 ```
+
+The optional MLflow UI mounts the SQLite file read-only. In testing, runs and versions written by the host showed up after refreshing the browser page, with no container restart. Model artifact files can’t be opened inside the container, because the database stores host file paths.
 
 To use another provider, set `LLM_BASE_URL`, `LLM_API_KEY` and `LLM_MODEL`.
 

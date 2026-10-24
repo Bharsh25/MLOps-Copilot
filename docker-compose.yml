@@ -1,0 +1,27 @@
+services:
+  model-api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    image: mlops-copilot-api
+    container_name: mlops-api        # keeps get_logs(source="api") working
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  mlflow-ui:
+    profiles: ["ui"]                 # only starts with --profile ui
+    image: ghcr.io/mlflow/mlflow:v3.17.2
+    container_name: mlops-mlflow-ui
+    command: mlflow server --backend-store-uri sqlite:////data/mlflow.db --host 0.0.0.0 --port 5000
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./mlflow.db:/data/mlflow.db:ro
+    restart: unless-stopped
