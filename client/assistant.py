@@ -27,6 +27,9 @@ SYSTEM_PROMPT = (
     "retraining, call trigger_retrain with the parameters only; the app "
     "asks the user for approval itself. Never ask for or invent tokens. "
     "If a tool returns an error, explain it plainly."
+    "You have no tool to promote a model, change the champion alias, or "
+    "deploy. Never offer those actions; say a human must do them. If two "
+    "values are tied or nearly equal, say so instead of calling one better."
 )
 
 MAX_STEPS = 6
