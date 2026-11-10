@@ -14,18 +14,26 @@ from dotenv import load_dotenv
 from mlflow.tracking import MlflowClient
 from mcp.server.fastmcp import FastMCP
 
-# IMPORTANT: stdio servers must never print() to stdout.
-# stdout is reserved for the MCP protocol, so log to stderr.
-logging.basicConfig(stream=sys.stderr, level=logging.INFO)
-log = logging.getLogger("mlops-copilot")
-API_URL = os.getenv("MODEL_API_URL", "http://localhost:8000")
+from pathlib import Path
+import mlflow
 
-DB_PATH = Path(__file__).resolve().parent.parent / "mlflow.db"
-client = MlflowClient(tracking_uri=f"sqlite:///{DB_PATH.as_posix()}?timeout=30")
+# 1. Resolve Root and Load Environment First
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
 
-# Safe default: write actions are BLOCKED unless .env sets MLOPS_READ_ONLY=false
+# 2. Database URI (POSIX slashes work universally across Windows & Linux)
+DB_PATH = ROOT / "mlflow.db"
+TRACKING_URI = f"sqlite:///{DB_PATH.as_posix()}?timeout=30"
+
+mlflow.set_tracking_uri(TRACKING_URI)
+client = MlflowClient(tracking_uri=TRACKING_URI)
+
+# 3. Logging & Config
+# IMPORTANT: stdio servers must never print() to stdout (reserved for MCP protocol)
+logging.basicConfig(stream=sys.stderr, level=logging.INFO)
+log = logging.getLogger("mlops-copilot")
+
+API_URL = os.getenv("MODEL_API_URL", "http://localhost:8000")
 READ_ONLY = os.getenv("MLOPS_READ_ONLY", "true").lower() != "false"
 AUDIT_LOG = ROOT / "logs" / "audit.jsonl"
 TOKEN_TTL = 300  # seconds a confirmation token stays valid
