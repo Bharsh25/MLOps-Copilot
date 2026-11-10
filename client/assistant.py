@@ -1,24 +1,38 @@
 import asyncio
+import concurrent.futures
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-from openai import OpenAI
+from openai import APIConnectionError, AuthenticationError, OpenAI, RateLimitError
 
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
 
-API_KEY = os.getenv("LLM_API_KEY") or os.getenv("GROQ_API_KEY")
+API_KEY = os.getenv("GROQ_API_KEY")
 BASE_URL = os.getenv("LLM_BASE_URL", "https://api.groq.com/openai/v1")
-MODEL = os.getenv("LLM_MODEL")
-if not API_KEY or not MODEL:
-    sys.exit("Set GROQ_API_KEY and LLM_MODEL in .env")
 
-llm = OpenAI(api_key=API_KEY, base_url=BASE_URL, max_retries=5)
+# LLM_MODELS: comma-separated, tried in order when a model is rate-limited.
+# A single LLM_MODEL still works, so an older .env doesn't break.
+_models = os.getenv("LLM_MODELS") or os.getenv("LLM_MODEL") or ""
+MODELS = [m.strip() for m in _models.split(",") if m.strip()]
+
+if not API_KEY or not MODELS:
+    # Not sys.exit(): a SystemExit raised while Streamlit imports this file
+    # leaves the browser stuck on "Running". A normal exception is displayed.
+    raise RuntimeError("Set GROQ_API_KEY and LLM_MODELS in .env")
+
+MODEL = MODELS[0]  # kept for any script that still imports MODEL
+
+# The SDK retries short per-minute limits by itself (it honours retry-after).
+# A used-up daily quota isn't worth waiting for: after two quick retries
+# (about 1.5 s) the error reaches chat_with_fallback, which tries the next model.
+llm = OpenAI(api_key=API_KEY, base_url=BASE_URL, max_retries=2)
 
 SYSTEM_PROMPT = (
     "You are MLOps Copilot. Use the tools to answer questions about ML "
@@ -35,7 +49,9 @@ SYSTEM_PROMPT = (
     "better."
 )
 
-MAX_STEPS = 6
+MAX_STEPS = 4          # LLM calls allowed per question
+TOOL_OUT_CHARS = 1500  # tool output sent to the model; the UI keeps the full text
+MAX_HISTORY = 12       # messages after the system prompt kept between questions
 
 
 def to_llm_tools(mcp_tools):
@@ -59,6 +75,55 @@ def to_llm_tools(mcp_tools):
     return tools
 
 
+def chat_with_fallback(messages, tools):
+    """Try each model in order; move to the next one only on a rate limit."""
+    last_err = None
+    for model in MODELS:
+        try:
+            return llm.chat.completions.create(
+                model=model, messages=messages, tools=tools, tool_choice="auto"
+            )
+        except RateLimitError as e:
+            print(f"  [model] {model} rate-limited, trying next...")
+            last_err = e
+    raise last_err  # every model in LLM_MODELS is rate-limited
+
+
+def trim_history(messages):
+    """Keep the system prompt and the last MAX_HISTORY messages.
+
+    The kept part must not start with a tool result whose tool call was cut
+    off, because the API rejects such a history.
+    """
+    system, rest = messages[:1], messages[1:]
+    if len(rest) > MAX_HISTORY:
+        rest = rest[-MAX_HISTORY:]
+        while rest and rest[0]["role"] == "tool":
+            rest = rest[1:]
+    messages[:] = system + rest
+
+
+def friendly_error(e):
+    """One sentence the user can act on, instead of a raw API error."""
+    if isinstance(e, RateLimitError):
+        text = str(e)
+        m = re.search(r"try again in ([\dhms.]+)", text)
+        wait = m.group(1).rstrip(".") if m else "a few minutes"
+        if "per day" in text:
+            return (
+                f"The free daily quota for the AI model is used up. Try again in "
+                f"about {wait}, or add another model to LLM_MODELS in .env."
+            )
+        return f"The AI model is busy (rate limit). Try again in about {wait}."
+    if isinstance(e, AuthenticationError):
+        return "The AI API rejected the key. Check GROQ_API_KEY in .env."
+    if isinstance(e, APIConnectionError):
+        return "Could not reach the AI API. Check your internet connection and LLM_BASE_URL."
+    if isinstance(e, (TimeoutError, concurrent.futures.TimeoutError, asyncio.TimeoutError)):
+        return "A tool took more than 3 minutes and was stopped. Try again, or check logs/server_stderr.log."
+    return f"Request failed: {str(e) or type(e).__name__}"
+
+
 async def call_tool(session, name, args):
     result = await session.call_tool(name, args)
     text = "\n".join(c.text for c in result.content if hasattr(c, "text"))
@@ -67,8 +132,9 @@ async def call_tool(session, name, args):
     return text
 
 
+# ---------- Terminal client (the Streamlit app has its own loop) ----------
 async def retrain_with_approval(session, args):
-    """The human approves here, in the app. The model never sees the token."""
+    """The human approves here, in the terminal. The model never sees the token."""
     args = {k: v for k, v in args.items() if k != "confirm_token"}
     preview_text = await call_tool(session, "trigger_retrain", args)
     try:
@@ -90,10 +156,9 @@ async def retrain_with_approval(session, args):
 
 
 async def run_turn(session, messages, tools):
+    trim_history(messages)
     for _ in range(MAX_STEPS):
-        resp = llm.chat.completions.create(
-            model=MODEL, messages=messages, tools=tools, tool_choice="auto"
-        )
+        resp = chat_with_fallback(messages, tools)
         msg = resp.choices[0].message
 
         if not msg.tool_calls:
@@ -132,7 +197,7 @@ async def run_turn(session, messages, tools):
                 output = await call_tool(session, name, args)
 
             messages.append(
-                {"role": "tool", "tool_call_id": tc.id, "content": output[:6000]}
+                {"role": "tool", "tool_call_id": tc.id, "content": output[:TOOL_OUT_CHARS]}
             )
 
     return "Stopped: too many tool steps for one question."
@@ -148,7 +213,8 @@ async def main():
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 tools = to_llm_tools((await session.list_tools()).tools)
-                print(f"Connected. {len(tools)} tools loaded. Type 'quit' to exit.\n")
+                print(f"Connected. {len(tools)} tools loaded. Models: {', '.join(MODELS)}")
+                print("Type 'quit' to exit.\n")
 
                 messages = [{"role": "system", "content": SYSTEM_PROMPT}]
                 while True:
@@ -157,9 +223,17 @@ async def main():
                         break
                     if not question:
                         continue
+                    mark = len(messages)
                     messages.append({"role": "user", "content": question})
-                    print("\nCopilot:", await run_turn(session, messages, tools), "\n")
+                    try:
+                        print("\nCopilot:", await run_turn(session, messages, tools), "\n")
+                    except Exception as e:
+                        del messages[mark:]  # keep the history consistent
+                        print("\nCopilot:", friendly_error(e), "\n")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nBye.")

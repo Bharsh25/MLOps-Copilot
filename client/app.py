@@ -11,12 +11,28 @@ from mcp.client.stdio import stdio_client
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from assistant import (  # noqa: E402
-    MAX_STEPS, MODEL, ROOT, SYSTEM_PROMPT, call_tool, llm, to_llm_tools,
+    MAX_STEPS, ROOT, SYSTEM_PROMPT, TOOL_OUT_CHARS, call_tool,
+    chat_with_fallback, friendly_error, to_llm_tools, trim_history,
 )
 
 READ_ONLY = os.getenv("MLOPS_READ_ONLY", "true").lower() != "false"
 
 st.set_page_config(page_title="MLOps Copilot", page_icon="🛠️")
+
+WELCOME = (
+    "👋 **Welcome to MLOps Copilot!**\n\n"
+    "I'm connected to your MLflow tracking server and model registry. Here is what I can do:\n"
+    "- **Experiment tracking:** list experiments and compare run metrics.\n"
+    "- **Registry management:** check model versions, champion tags and status.\n"
+    "- **CI/CD & retraining:** inspect deployment status or trigger a retrain (with your approval).\n\n"
+    "*Click a quick prompt above, or type a question below to start.*"
+)
+
+PRESETS = {
+    "deploy": "Check the deployment status of breast-cancer-model and see if it matches champion version.",
+    "compare": "Compare the latest runs and show me which one had the best performance.",
+    "models": "List all registered models and their active versions.",
+}
 
 
 # ---------- MCP connection that survives Streamlit reruns ----------
@@ -69,9 +85,7 @@ def get_bridge():
 def advance(bridge, messages, trace):
     """Run the model until it answers, or until a retrain needs approval."""
     for _ in range(MAX_STEPS):
-        resp = llm.chat.completions.create(
-            model=MODEL, messages=messages, tools=bridge.tools, tool_choice="auto"
-        )
+        resp = chat_with_fallback(messages, bridge.tools)
         msg = resp.choices[0].message
         if not msg.tool_calls:
             messages.append({"role": "assistant", "content": msg.content or ""})
@@ -127,9 +141,9 @@ def advance(bridge, messages, trace):
             else:
                 out = bridge.call(name, args)
 
-            trace.append({"name": name, "args": args, "output": out})
+            trace.append({"name": name, "args": args, "output": out})  # full text for the UI
             messages.append(
-                {"role": "tool", "tool_call_id": tc.id, "content": out[:6000]}
+                {"role": "tool", "tool_call_id": tc.id, "content": out[:TOOL_OUT_CHARS]}
             )
 
         if pending:
@@ -149,11 +163,15 @@ def finish(kind, value):
 
 # ---------- State ----------
 ss = st.session_state
-ss.setdefault("messages", [{"role": "system", "content": SYSTEM_PROMPT}])
-ss.setdefault("chat", [])
+ss.setdefault("messages", [{"role": "system", "content": SYSTEM_PROMPT}])  # sent to the LLM
+ss.setdefault("chat", [])                                                  # shown in the UI
 ss.setdefault("pending", None)
 ss.setdefault("trace", [])
 ss.setdefault("error", None)
+
+# Welcome text lives only in the UI history, so it is never sent to the LLM.
+if not ss.chat:
+    ss.chat.append({"role": "assistant", "content": WELCOME})
 
 try:
     bridge = get_bridge()
@@ -182,12 +200,27 @@ with st.sidebar:
             ss.pop(k, None)
         st.rerun()
 
-# ---------- Chat history ----------
+# ---------- Header, errors, quick prompts ----------
 st.title("MLOps Copilot")
+st.caption("AI-powered assistant for MLflow experiment tracking, model registry, and deployment checks.")
+
 if ss.error:
     st.error(ss.error)
     ss.error = None
 
+busy = bool(ss.pending)  # no new questions while an approval is waiting
+
+st.markdown("##### ⚡ Quick Prompts")
+c1, c2, c3 = st.columns(3)
+preset_query = None
+if c1.button("🔍 Check Deployment", disabled=busy):
+    preset_query = PRESETS["deploy"]
+if c2.button("📊 Compare Runs", disabled=busy):
+    preset_query = PRESETS["compare"]
+if c3.button("📋 List All Models", disabled=busy):
+    preset_query = PRESETS["models"]
+
+# ---------- Chat history ----------
 for item in ss.chat:
     with st.chat_message(item["role"]):
         st.markdown(item["content"])
@@ -201,9 +234,9 @@ for item in ss.chat:
 if ss.pending:
     p = ss.pending
     st.warning(f"**Approval needed**\n\n{p['preview']}")
-    c1, c2 = st.columns(2)
-    approve = c1.button("✅ Approve", type="primary")
-    cancel = c2.button("❌ Cancel")
+    a1, a2 = st.columns(2)
+    approve = a1.button("✅ Approve", type="primary")
+    cancel = a2.button("❌ Cancel")
     if approve or cancel:
         try:
             if approve:
@@ -213,32 +246,44 @@ if ss.pending:
                     )
             else:
                 out = json.dumps({"status": "CANCELLED_BY_USER"})
-            ss.trace.append({"name": "trigger_retrain", "args": p["args"], "output": out})
-            ss.messages.append(
-                {"role": "tool", "tool_call_id": p["tool_call_id"], "content": out[:6000]}
-            )
-            ss.pending = None
+        except Exception as e:
+            # Still answer the tool call, or the LLM history becomes invalid.
+            out = json.dumps({"status": "FAILED", "error": str(e)})
+
+        ss.trace.append({"name": "trigger_retrain", "args": p["args"], "output": out})
+        ss.messages.append(
+            {"role": "tool", "tool_call_id": p["tool_call_id"], "content": out[:TOOL_OUT_CHARS]}
+        )
+        ss.pending = None
+        try:
             with st.spinner("Thinking..."):
                 finish(*advance(bridge, ss.messages, ss.trace))
         except Exception as e:
-            ss.pending = None
-            ss.error = f"Something failed after your decision: {e}"
+            ss.error = friendly_error(e)
         st.rerun()
 
-# ---------- Input ----------
+# ---------- Input (typed question or quick prompt) ----------
 prompt = st.chat_input(
-    "Ask about experiments, models, or deployment...", disabled=bool(ss.pending)
-)
-if prompt:
-    mark = len(ss.messages)
+    "Ask about experiments, models, or deployment...", disabled=busy
+) or preset_query
+
+if prompt and not ss.pending:
+    trim_history(ss.messages)  # before the marks, so the rollback stays correct
+    mark_msgs, mark_chat = len(ss.messages), len(ss.chat)
     ss.chat.append({"role": "user", "content": prompt})
     ss.messages.append({"role": "user", "content": prompt})
     ss.trace = []
+
+    with st.chat_message("user"):  # show the question now, not after the rerun
+        st.markdown(prompt)
+
     try:
-        with st.spinner("Thinking..."):
-            finish(*advance(bridge, ss.messages, ss.trace))
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                finish(*advance(bridge, ss.messages, ss.trace))
     except Exception as e:
-        del ss.messages[mark:]  # keep the conversation consistent
-        ss.chat.pop()
-        ss.error = f"Request failed: {e}"
+        del ss.messages[mark_msgs:]  # keep both histories consistent
+        del ss.chat[mark_chat:]
+        ss.trace = []
+        ss.error = friendly_error(e)
     st.rerun()
