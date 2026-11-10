@@ -14,18 +14,31 @@ from openai import APIConnectionError, AuthenticationError, OpenAI, RateLimitErr
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
 
-API_KEY = os.getenv("GROQ_API_KEY")
-BASE_URL = os.getenv("LLM_BASE_URL", "https://api.groq.com/openai/v1")
+# Safely check Streamlit secrets if running in Streamlit Cloud
+def _get_config(key: str, default: str | None = None) -> str | None:
+    val = os.getenv(key)
+    if val:
+        return val
+    try:
+        import streamlit as st
+        if key in st.secrets:
+            return str(st.secrets[key])
+    except Exception:
+        pass
+    return default
+
+API_KEY = _get_config("GROQ_API_KEY")
+BASE_URL = _get_config("LLM_BASE_URL", "https://api.groq.com/openai/v1")
 
 # LLM_MODELS: comma-separated, tried in order when a model is rate-limited.
-# A single LLM_MODEL still works, so an older .env doesn't break.
-_models = os.getenv("LLM_MODELS") or os.getenv("LLM_MODEL") or ""
+_models = _get_config("LLM_MODELS") or _get_config("LLM_MODEL") or ""
 MODELS = [m.strip() for m in _models.split(",") if m.strip()]
 
 if not API_KEY or not MODELS:
-    # Not sys.exit(): a SystemExit raised while Streamlit imports this file
-    # leaves the browser stuck on "Running". A normal exception is displayed.
-    raise RuntimeError("Set GROQ_API_KEY and LLM_MODELS in .env")
+    raise RuntimeError(
+        "Missing configuration: Set GROQ_API_KEY and LLM_MODELS in .env (local) "
+        "or under App Settings > Secrets in Streamlit Cloud."
+    )
 
 MODEL = MODELS[0]  # kept for any script that still imports MODEL
 
