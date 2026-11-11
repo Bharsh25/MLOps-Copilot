@@ -11,7 +11,7 @@ from mcp.client.stdio import stdio_client
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from assistant import (  # noqa: E402
-    MAX_STEPS, ROOT, SYSTEM_PROMPT, TOOL_OUT_CHARS, call_tool,
+    MAX_STEPS, ROOT, SYSTEM_PROMPT, TOOL_OUT_CHARS, _get_config, call_tool,
     chat_with_fallback, friendly_error, to_llm_tools, trim_history,
 )
 
@@ -19,20 +19,44 @@ READ_ONLY = os.getenv("MLOPS_READ_ONLY", "true").lower() != "false"
 
 st.set_page_config(page_title="MLOps Copilot", page_icon="🛠️")
 
-WELCOME = (
-    "👋 **Welcome to MLOps Copilot!**\n\n"
-    "I'm connected to your MLflow tracking server and model registry. Here is what I can do:\n"
-    "- **Experiment tracking:** list experiments and compare run metrics.\n"
-    "- **Registry management:** check model versions, champion tags and status.\n"
-    "- **CI/CD & retraining:** inspect deployment status or trigger a retrain (with your approval).\n\n"
-    "*Click a quick prompt above, or type a question below to start.*"
-)
+
+def build_welcome(read_only: bool) -> str:
+    """Welcome text that only promises what this deployment can actually do."""
+    retrain = (
+        "retraining is disabled in this deployment (read-only mode)."
+        if read_only
+        else "trigger a retrain, which always asks for your approval first."
+    )
+    return (
+        "👋 **Welcome to MLOps Copilot!**\n\n"
+        "I'm connected to an MLflow tracking server and model registry. Here is what I can do:\n"
+        "- **Experiment tracking:** list experiments and compare run metrics.\n"
+        "- **Model registry:** show model versions and which one is the champion.\n"
+        f"- **Deployment and retraining:** check whether the model API is up to date; {retrain}\n\n"
+        "*Click a quick prompt above, or type a question below to start.*"
+    )
+
 
 PRESETS = {
     "deploy": "Check the deployment status of breast-cancer-model and see if it matches champion version.",
     "compare": "Compare the latest runs and show me which one had the best performance.",
     "models": "List all registered models and their active versions.",
 }
+
+
+def server_env():
+    """Settings for the MCP server process.
+
+    The MCP library starts the server with only a small default environment,
+    so settings that come from Streamlit secrets must be passed explicitly.
+    Locally the server also reads .env by itself.
+    """
+    env = {}
+    for key in ("MODEL_API_URL", "MLOPS_READ_ONLY"):
+        val = _get_config(key)
+        if val is not None:
+            env[key] = val
+    return env or None
 
 
 # ---------- MCP connection that survives Streamlit reruns ----------
@@ -56,6 +80,8 @@ class Bridge:
             params = StdioServerParameters(
                 command=sys.executable,
                 args=[str(ROOT / "server" / "mlflow_server.py")],
+                env=server_env(),
+                cwd=str(ROOT),
             )
             with open(ROOT / "logs" / "server_stderr.log", "a") as errlog:
                 async with stdio_client(params, errlog=errlog) as (read, write):
@@ -171,7 +197,7 @@ ss.setdefault("error", None)
 
 # Welcome text lives only in the UI history, so it is never sent to the LLM.
 if not ss.chat:
-    ss.chat.append({"role": "assistant", "content": WELCOME})
+    ss.chat.append({"role": "assistant", "content": build_welcome(READ_ONLY)})
 
 try:
     bridge = get_bridge()
@@ -190,11 +216,17 @@ with st.sidebar:
         except Exception as e:
             ss.status = {"status": "UNKNOWN", "error": str(e)}
     s = ss.status
-    st.write("Model API:", "🟢 UP" if s.get("status") == "UP" else f"🔴 {s.get('status')}")
+    status = s.get("status")
+    labels = {"UP": "🟢 UP", "NOT_CONFIGURED": "⚪ Not configured"}
+    st.write("Model API:", labels.get(status, f"🔴 {status}"))
     st.write("Deployed version:", s.get("deployed_version", "-"))
     st.write("Champion version:", s.get("champion_version", "-"))
-    if s.get("status") == "UP":
+    if status == "UP":
         st.write("Up to date:", "✅" if s.get("up_to_date") else "⚠️ no")
+    else:
+        note = s.get("detail") or s.get("error")
+        if note:
+            st.caption(note)
     if st.button("Clear chat"):
         for k in ("messages", "chat", "pending", "trace", "error"):
             ss.pop(k, None)

@@ -14,6 +14,7 @@ from openai import APIConnectionError, AuthenticationError, OpenAI, RateLimitErr
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
 
+
 # Safely check Streamlit secrets if running in Streamlit Cloud
 def _get_config(key: str, default: str | None = None) -> str | None:
     val = os.getenv(key)
@@ -27,17 +28,20 @@ def _get_config(key: str, default: str | None = None) -> str | None:
         pass
     return default
 
-API_KEY = _get_config("GROQ_API_KEY")
+
+# LLM_API_KEY is for any OpenAI-compatible provider; GROQ_API_KEY is the default.
+API_KEY = _get_config("LLM_API_KEY") or _get_config("GROQ_API_KEY")
 BASE_URL = _get_config("LLM_BASE_URL", "https://api.groq.com/openai/v1")
 
 # LLM_MODELS: comma-separated, tried in order when a model is rate-limited.
+# LLM_MODEL (a single name) still works.
 _models = _get_config("LLM_MODELS") or _get_config("LLM_MODEL") or ""
 MODELS = [m.strip() for m in _models.split(",") if m.strip()]
 
 if not API_KEY or not MODELS:
     raise RuntimeError(
-        "Missing configuration: Set GROQ_API_KEY and LLM_MODELS in .env (local) "
-        "or under App Settings > Secrets in Streamlit Cloud."
+        "Missing configuration: set GROQ_API_KEY (or LLM_API_KEY) and LLM_MODELS "
+        "in .env (local) or under App Settings > Secrets in Streamlit Cloud."
     )
 
 MODEL = MODELS[0]  # kept for any script that still imports MODEL
@@ -45,7 +49,8 @@ MODEL = MODELS[0]  # kept for any script that still imports MODEL
 # The SDK retries short per-minute limits by itself (it honours retry-after).
 # A used-up daily quota isn't worth waiting for: after two quick retries
 # (about 1.5 s) the error reaches chat_with_fallback, which tries the next model.
-llm = OpenAI(api_key=API_KEY, base_url=BASE_URL, max_retries=2)
+# timeout=60 stops one slow request from freezing the app.
+llm = OpenAI(api_key=API_KEY, base_url=BASE_URL, max_retries=2, timeout=60)
 
 SYSTEM_PROMPT = (
     "You are MLOps Copilot. Use the tools to answer questions about ML "
@@ -55,8 +60,12 @@ SYSTEM_PROMPT = (
     "called compare_runs. For retraining, call trigger_retrain with the "
     "parameters only; the app asks the user for approval itself. Never ask "
     "for or invent tokens. After a retrain, just report the run ID, the "
-    "version and the metrics. If a tool returns an error, explain it "
-    "plainly. You have no tool to promote a model, change the champion "
+    "version and the metrics. If a tool returns an error, state what it "
+    "says in plain words. When a tool reports DOWN, repeat what the tool "
+    "says. Do not guess causes such as a stopped container, and do not "
+    "suggest fixes the tool did not mention. If the status is "
+    "NOT_CONFIGURED, say the model API is not set up in this deployment. "
+    "You have no tool to promote a model, change the champion "
     "alias, or deploy. Never offer those actions; say a human must do them. "
     "If two values are tied or nearly equal, say so instead of calling one "
     "better."
@@ -129,7 +138,7 @@ def friendly_error(e):
             )
         return f"The AI model is busy (rate limit). Try again in about {wait}."
     if isinstance(e, AuthenticationError):
-        return "The AI API rejected the key. Check GROQ_API_KEY in .env."
+        return "The AI API rejected the key. Check GROQ_API_KEY (or LLM_API_KEY) in .env."
     if isinstance(e, APIConnectionError):
         return "Could not reach the AI API. Check your internet connection and LLM_BASE_URL."
     if isinstance(e, (TimeoutError, concurrent.futures.TimeoutError, asyncio.TimeoutError)):

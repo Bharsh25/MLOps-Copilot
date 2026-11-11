@@ -1,51 +1,73 @@
-import logging
-import sys
-from pathlib import Path
-import os
-import httpx
 import json
+import logging
+import os
+import re
 import secrets
 import subprocess
+import sys
 import time
 from datetime import datetime, timezone
-
-from dotenv import load_dotenv
-
-from mlflow.tracking import MlflowClient
-from mcp.server.fastmcp import FastMCP
-
 from pathlib import Path
-import mlflow
 
-# 1. Resolve Root and Load Environment First
+import httpx
+import mlflow
+from dotenv import load_dotenv
+from mcp.server.fastmcp import FastMCP
+from mlflow.tracking import MlflowClient
+
+# 1. Resolve root and load environment first
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
 
-# 2. Database URI (POSIX slashes work universally across Windows & Linux)
+# 2. Database URI (POSIX slashes work on Windows and Linux)
 DB_PATH = ROOT / "mlflow.db"
 TRACKING_URI = f"sqlite:///{DB_PATH.as_posix()}?timeout=30"
 
 mlflow.set_tracking_uri(TRACKING_URI)
 client = MlflowClient(tracking_uri=TRACKING_URI)
 
-# 3. Logging & Config
-# IMPORTANT: stdio servers must never print() to stdout (reserved for MCP protocol)
+# 3. Logging and config
+# IMPORTANT: stdio servers must never print() to stdout (reserved for the MCP protocol).
 logging.basicConfig(stream=sys.stderr, level=logging.INFO)
 log = logging.getLogger("mlops-copilot")
 
-API_URL = os.getenv("MODEL_API_URL", "http://localhost:8000")
+# 127.0.0.1 instead of "localhost": in some Linux containers "localhost" resolves to
+# IPv6 (::1) and fails with "[Errno 99] Cannot assign requested address".
+# Set MODEL_API_URL to an empty value (or "none") when no model API exists,
+# for example on a hosted demo.
+API_URL = os.getenv("MODEL_API_URL", "http://127.0.0.1:8000").strip()
+if API_URL.lower() in {"none", "off", "disabled", "false"}:
+    API_URL = ""
+
 READ_ONLY = os.getenv("MLOPS_READ_ONLY", "true").lower() != "false"
 AUDIT_LOG = ROOT / "logs" / "audit.jsonl"
 TOKEN_TTL = 300  # seconds a confirmation token stays valid
 PENDING: dict[str, dict] = {}
 
+# Names that reach MLflow filters or ORDER BY clauses must be plain identifiers.
+_SAFE_NAME = re.compile(r"^[A-Za-z0-9_.\-/]{1,100}$")
 
-def audit(event: str, **details) -> None:
-    """Append one JSON line to the audit log."""
-    AUDIT_LOG.parent.mkdir(exist_ok=True)
-    entry = {"time": datetime.now(timezone.utc).isoformat(), "event": event, **details}
-    with open(AUDIT_LOG, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry) + "\n")
+
+def _check_name(value: str, label: str) -> str:
+    if not _SAFE_NAME.match(value or ""):
+        raise ValueError(
+            f"{label} may only contain letters, numbers and _ . - / (max 100 characters)."
+        )
+    return value
+
+
+def audit(event: str, **details) -> bool:
+    """Append one JSON line to the audit log. Returns False if it could not be written."""
+    try:
+        AUDIT_LOG.parent.mkdir(exist_ok=True)
+        entry = {"time": datetime.now(timezone.utc).isoformat(), "event": event, **details}
+        with open(AUDIT_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+        return True
+    except OSError as e:
+        log.error("audit log could not be written: %s", e)
+        return False
+
 
 mcp = FastMCP("mlops-copilot")
 
@@ -58,7 +80,6 @@ def list_experiments() -> list[dict]:
     results = []
     for exp in client.search_experiments():
         runs = client.search_runs([exp.experiment_id], max_results=1000)
-
         results.append(
             {
                 "name": exp.name,
@@ -81,10 +102,15 @@ def compare_runs(
     Args:
         experiment_name: Exact experiment name, e.g. 'breast-cancer-classifier'.
         metric: Metric to rank by, e.g. 'f1', 'accuracy', or 'silhouette'.
-        top_n: How many top runs to return (default 5).
-        higher_is_better: True for accuracy/f1/silhouette, False for error metrics like rmse.
+        top_n: How many top runs to return, 1 to 50 (default 5).
+        higher_is_better: True for accuracy, f1 and silhouette. False for error
+            metrics such as rmse and for Davies-Bouldin, where lower is better.
     """
     log.info("tool called: compare_runs(%s, %s)", experiment_name, metric)
+    _check_name(metric, "metric")
+    if not 1 <= top_n <= 50:
+        raise ValueError("top_n must be between 1 and 50.")
+
     exp = client.get_experiment_by_name(experiment_name)
     if exp is None:
         raise ValueError(
@@ -123,6 +149,7 @@ def list_registered_models() -> list[dict]:
         for m in client.search_registered_models()
     ]
 
+
 @mcp.tool()
 def get_model_info(model_name: str) -> dict:
     """Get all versions of one registered model, including the source run's
@@ -132,6 +159,7 @@ def get_model_info(model_name: str) -> dict:
         model_name: Exact registered model name, e.g. 'breast-cancer-model'.
     """
     log.info("tool called: get_model_info(%s)", model_name)
+    _check_name(model_name, "model_name")
     versions = client.search_model_versions(f"name='{model_name}'")
     if not versions:
         raise ValueError(
@@ -158,27 +186,51 @@ def get_model_info(model_name: str) -> dict:
         )
     return {"model_name": model_name, "versions": result}
 
+
 @mcp.tool()
 def check_deployment_status(model_name: str = "breast-cancer-model") -> dict:
-    """Check whether the deployed model API is running and whether it serves
-    the current 'champion' version from the registry.
+    """Check whether the deployed model API is reachable and whether it serves
+    the current 'champion' version from the registry. Report the result exactly
+    as returned. If the status is DOWN, the cause is not known to this tool.
 
     Args:
         model_name: Registered model name (default 'breast-cancer-model').
     """
     log.info("tool called: check_deployment_status(%s)", model_name)
-    registered = client.get_registered_model(model_name)
+    _check_name(model_name, "model_name")
+    try:
+        registered = client.get_registered_model(model_name)
+    except Exception:
+        raise ValueError(
+            f"Model '{model_name}' not found. Call list_registered_models first."
+        )
     champion = (registered.aliases or {}).get("champion")
     champion_version = str(champion) if champion is not None else None
 
+    if not API_URL:
+        return {
+            "status": "NOT_CONFIGURED",
+            "detail": "No model API is set up for this deployment (MODEL_API_URL is empty).",
+            "champion_version": champion_version,
+        }
+
     try:
-        resp = httpx.get(f"{API_URL}/health", timeout=5)
+        resp = httpx.get(f"{API_URL}/health", timeout=10)
         resp.raise_for_status()
         health = resp.json()
+    except httpx.HTTPStatusError as e:
+        return {
+            "status": "DOWN",
+            "detail": f"The API at {API_URL} answered with HTTP {e.response.status_code}.",
+            "champion_version": champion_version,
+        }
     except Exception as e:
         return {
             "status": "DOWN",
-            "error": str(e),
+            "detail": (
+                f"Could not connect to the API at {API_URL} "
+                f"({type(e).__name__}: {str(e)[:150]})."
+            ),
             "champion_version": champion_version,
         }
 
@@ -190,6 +242,7 @@ def check_deployment_status(model_name: str = "breast-cancer-model") -> dict:
         "champion_version": champion_version,
         "up_to_date": deployed == champion_version,
     }
+
 
 @mcp.tool()
 def trigger_retrain(
@@ -260,9 +313,13 @@ def trigger_retrain(
             "reason": "Token is invalid, expired, already used, or the parameters changed. Start again without a token.",
         }
 
-    # 5. Execute
-        # 5. Execute
-    audit("started", params=params, token=confirm_token)
+    # 5. Execute. A write must never run without an audit record.
+    if not audit("started", params=params, token=confirm_token):
+        return {
+            "status": "FAILED",
+            "error": "The audit log is not writable, so the retrain was not started.",
+        }
+
     cmd = [
         sys.executable,
         str(ROOT / "training" / "retrain.py"),
@@ -327,6 +384,7 @@ def trigger_retrain(
         "note": "New version registered. Champion and the deployed model are unchanged.",
     }
 
+
 @mcp.tool()
 def get_logs(source: str = "audit", lines: int = 20) -> dict:
     """Read recent logs to see what happened and why something failed.
@@ -360,8 +418,13 @@ def get_logs(source: str = "audit", lines: int = 20) -> dict:
                 ["docker", "logs", "--tail", str(lines), "mlops-api"],
                 capture_output=True, text=True, timeout=15,
             )
-        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-            return {"source": "api", "error": f"Could not read container logs: {e}"}
+        except FileNotFoundError:
+            return {
+                "source": "api",
+                "error": "Docker is not available in this environment, so container logs cannot be read.",
+            }
+        except subprocess.TimeoutExpired:
+            return {"source": "api", "error": "Reading the container logs timed out."}
         if proc.returncode != 0:
             return {"source": "api", "error": proc.stderr[-500:]}
         return {"source": "api", "logs": (proc.stdout + proc.stderr)[-4000:]}
