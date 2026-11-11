@@ -1,0 +1,9 @@
+{
+  "model_name": "breast-cancer-model",
+  "model_version": "1",
+  "run_id": "13ac33c50b6b435e92dbb3ce0e86f66d",
+  "metrics": {
+    "accuracy": 0.9649122807017544,
+    "f1": 0.9722222222222222
+  }
+}
