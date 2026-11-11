@@ -17,6 +17,7 @@ You can ask things like:
 
 ## Chat UI
 <img width="1917" height="970" alt="image" src="https://github.com/user-attachments/assets/7ffbe4be-d96c-44be-9a43-0140da33e3c3" />
+
 ## MCP
 <img width="1917" height="967" alt="image" src="https://github.com/user-attachments/assets/db6b0355-86c7-457a-8a4e-1b6f3748c6e4" />
 
